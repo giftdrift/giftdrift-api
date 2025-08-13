@@ -37,7 +37,7 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
   const { min, max } = BUDGETS[budget_bucket] || { min: 0, max: null };
   const lang = language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en");
 
-  // 1) Строгий запрос (как в твоём успешном логе: RU, ru, цена, доставка)
+  // 1) Строгий запрос (как в твоём успешном логе: RU/BR, локальный язык, цена и доставка)
   const strict = await callTop("aliexpress.affiliate.product.query", {
     keywords,
     target_language: lang,
@@ -51,7 +51,7 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
   });
   if (strict.items.length) return strict.items;
 
-  // 2) Релакс — убираем фильтры цены/доставки и берём популярность
+  // 2) Релакс — убираем цену/доставку и берём популярность
   const relaxed = await callTop("aliexpress.affiliate.product.query", {
     keywords,
     target_language: lang,
@@ -119,7 +119,7 @@ async function callTop(method, bizParams) {
     throw new Error(`AE error: ${msg}`);
   }
 
-  // --- ЖЕЛЕЗНЫЙ ПАРСЕР ---
+  // --- ЖЕЛЕЗНЫЙ ПАРСЕР — под твою структуру (products.product[]) + фолбэк ---
   const products = extractProducts(data);
   console.log("AE parsed items:", products.length);
 
@@ -128,51 +128,43 @@ async function callTop(method, bizParams) {
 }
 
 function extractProducts(data) {
-  // 1) Самые частые «обёртки» TOP
+  // 1) TOP-обёртки
   let node =
     data?.aliexpress_affiliate_product_query_response?.resp_result?.result ??
     data?.aliexpress_affiliate_product_query_response?.result ??
-    data?.result ??
-    data?.data ??
-    data;
+    data?.result ?? data?.data ?? data;
 
-  // 2) Иногда result приходит строкой JSON
+  // 2) Если result — строка JSON
   if (typeof node === "string") {
     try { node = JSON.parse(node); } catch {}
   }
 
-  // 3) Популярные пути
+  // 3) Точный путь из твоего ae-test: products.product[]
   let list =
+    node?.products?.product ??
+    node?.result_list?.products?.product ?? // иногда лежит глубже
     node?.result_list?.products ??
-    node?.result_list?.product ??        // бывает "product" (ед. число)
-    node?.products ??
-    node?.items;
+    node?.result_list?.product ??
+    node?.products ?? node?.items;
 
   if (Array.isArray(list)) return list;
 
-  // 4) Глубокий поиск первого «похожего» массива
-  const found = deepFindFirstArray(node);
-  return Array.isArray(found) ? found : [];
+  // 4) Глубокий поиск первого массива, похожего на список товаров
+  const deep = deepFindFirstArray(node);
+  return Array.isArray(deep) ? deep : [];
 }
 
 function deepFindFirstArray(obj, depth = 0) {
   if (!obj || typeof obj !== "object" || depth > 6) return null;
-
   if (Array.isArray(obj)) {
-    // проверим, похоже ли на массив товаров
     if (obj.length && typeof obj[0] === "object") {
       const p = obj[0];
-      if (
-        "product_id" in p || "item_id" in p ||
-        "product_title" in p || "title" in p
-      ) return obj;
+      if ("product_id" in p || "item_id" in p || "product_title" in p || "title" in p) return obj;
     }
     return null;
   }
-
   for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    const r = deepFindFirstArray(v, depth + 1);
+    const r = deepFindFirstArray(obj[k], depth + 1);
     if (r) return r;
   }
   return null;
