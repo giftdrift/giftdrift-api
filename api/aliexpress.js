@@ -1,6 +1,5 @@
 // api/aliexpress.js
-// AliExpress Affiliate API (TOP) — подпись MD5 (secret + keyvalue + secret)
-// и timestamp в формате 'YYYY-MM-DD HH:mm:ss' (GMT+8).
+// AliExpress Affiliate API (TOP). Подпись MD5 + fallback-запрос, если строгие фильтры дали 0 результатов.
 
 import crypto from "crypto";
 
@@ -37,38 +36,73 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
   const keywords = pickKeywords(interests).join(" ");
   const { min, max } = BUDGETS[budget_bucket] || { min: 0, max: null };
   const lang = language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en");
-  const ts = topTimestampCN(); // 'YYYY-MM-DD HH:mm:ss' GMT+8
 
-  const params = {
-    method: "aliexpress.affiliate.product.query",
-    app_key: APP_KEY,
-    sign_method: "md5",
-    format: "json",
-    v: "1.0",
-    timestamp: ts,
-
-    // бизнес-параметры
+  // 1) Строгий запрос
+  const strictParams = {
     keywords,
     target_language: lang,
     page_size: "40",
     page_no: String(page),
-    ship_to_country: country,
+    ship_to_country: country,   // может "убивать" выдачу
     sort: "SALE_PRICE_ASC",
     tracking_id: TRACK_ID,
     min_price: min != null ? String(min) : undefined,
     max_price: max != null ? String(max) : undefined,
   };
 
+  const strict = await callTop("aliexpress.affiliate.product.query", strictParams);
+  if (strict.items.length > 0) return strict.items;
+
+  // 2) Релакс-запрос: убираем цену/доставку, сортируем по объёму/популярности
+  const relaxedParams = {
+    keywords,
+    target_language: lang,
+    page_size: "40",
+    page_no: String(page),
+    sort: "VOLUME_DESC",       // популярность
+    tracking_id: TRACK_ID
+  };
+
+  const relaxed = await callTop("aliexpress.affiliate.product.query", relaxedParams);
+  // Чтобы легче дебажить, если снова пусто — поднимем «мягкую» ошибку (её поймает recommendations и покажет debug)
+  if (relaxed.items.length === 0) {
+    console.warn("AE zero results after relaxed query", {
+      kw: keywords, lang, page, country, budget_bucket
+    });
+  }
+  return relaxed.items;
+}
+
+// ----------- TOP caller + utils -----------
+
+async function callTop(method, bizParams) {
+  const ts = topTimestampCN(); // 'YYYY-MM-DD HH:mm:ss' GMT+8
+
+  const params = {
+    method,
+    app_key: APP_KEY,
+    sign_method: "md5",
+    format: "json",
+    v: "1.0",
+    timestamp: ts,
+    ...bizParams
+  };
+
   const clean = Object.fromEntries(Object.entries(params).filter(([,v]) => v !== undefined));
   const sign = signParamsMD5(clean, APP_SECRET);
   const body = new URLSearchParams({ ...clean, sign }).toString();
 
-  // безопасный лог (без секрета и без длинных данных)
   console.log("AE request meta:", {
     method: clean.method,
     sign_method: clean.sign_method,
     timestamp: clean.timestamp,
     hasSign: !!sign,
+    // короткий слепок бизнес-параметров
+    page_no: clean.page_no,
+    page_size: clean.page_size,
+    sort: clean.sort,
+    ship_to_country: !!clean.ship_to_country,
+    priced: (clean.min_price || clean.max_price) ? true : false
   });
 
   const rsp = await fetch(GATEWAY, {
@@ -97,10 +131,9 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     data?.products ||
     [];
 
-  return (Array.isArray(list) ? list : []).map(toItem(lang)).filter(Boolean);
+  const items = (Array.isArray(list) ? list : []).map(toItem()).filter(Boolean);
+  return { items, rawCount: Array.isArray(list) ? list.length : 0 };
 }
-
-// ---------- helpers ----------
 
 function pickKeywords(interests = []) {
   const out = [];
@@ -111,7 +144,7 @@ function pickKeywords(interests = []) {
   return out.length ? out : ["gift", "present"];
 }
 
-// Подпись TOP MD5: MD5( secret + k1v1k2v2... + secret ), ключи в ASCII-порядке
+// TOP MD5: MD5(secret + k1v1k2v2... + secret), ключи по ASCII
 function signParamsMD5(params, secret) {
   const sortedKeys = Object.keys(params).sort();
   const concatenated = sortedKeys.map(k => `${k}${params[k]}`).join("");
@@ -119,9 +152,8 @@ function signParamsMD5(params, secret) {
   return crypto.createHash("md5").update(str, "utf8").digest("hex").toUpperCase();
 }
 
-// timestamp 'YYYY-MM-DD HH:mm:ss' в часовом поясе GMT+8
+// 'YYYY-MM-DD HH:mm:ss' в GMT+8
 function topTimestampCN(date = new Date()) {
-  // смещение GMT+8 = 8*60 минут
   const offsetMin = 8 * 60;
   const local = new Date(date.getTime() + (offsetMin - date.getTimezoneOffset()) * 60000);
   const pad = (n) => String(n).padStart(2, "0");
@@ -134,7 +166,7 @@ function topTimestampCN(date = new Date()) {
   return `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
 }
 
-function toItem(lang) {
+function toItem() {
   return (p) => {
     const title = p?.product_title || p?.title || p?.item_title;
     const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
