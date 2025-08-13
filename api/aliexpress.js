@@ -1,16 +1,14 @@
-// Lightweight AliExpress Affiliate client.
-// Работает так: собираем параметры вызова метода,
-// подписываем их секретом и дергаем gateway. Если не получится — кидаем ошибку.
-// В handler мы поймаем ошибку и вернем моки.
+// api/aliexpress.js
+// Лёгкий клиент AliExpress Affiliate API: подписывает запрос и возвращает товары.
+// Если AliExpress вернёт ошибку, выбрасываем исключение — recommendations.js подхватит и уйдёт в моки.
 
 import crypto from "crypto";
 
-const GATEWAY = "https://api-sg.aliexpress.com/sync"; // актуальный gateway для Open Platform (Affiliate)
+const GATEWAY = "https://api-sg.aliexpress.com/sync";
 const APP_KEY = process.env.AE_APP_KEY;
 const APP_SECRET = process.env.AE_APP_SECRET;
 const TRACK_ID = process.env.AE_TRACKING_ID;
 
-// Маппинг наших бюджетов → min/max (USD условно)
 const BUDGETS = {
   "$0-10":   { min: 0,   max: 10 },
   "$11-49":  { min: 11,  max: 49 },
@@ -39,28 +37,23 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
   const kw = pickKeywords(interests);
   const { min, max } = BUDGETS[budget_bucket] || { min: 0, max: null };
 
-  // Бизнес‑параметры метода (имена параметров у AliExpress могут отличаться;
-  // если у тебя в консоли AliExpress есть "API Explorer" — бери оттуда точные названия.
-  // Эта заготовка покрывает типичный вызов aliexpress.affiliate.product.query)
   const params = {
     method: "aliexpress.affiliate.product.query",
     app_key: APP_KEY,
     timestamp: Date.now().toString(),
     sign_method: "HMAC-SHA256",
-    // бизнес-поля:
     keywords: kw.join(" "),
-    target_language: language.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en"),
+    target_language: language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en"),
     page_size: "40",
     page_no: String(page),
-    ship_to_country: country, // "RU" или "BR"
+    ship_to_country: country,
     sort: "SALE_PRICE_ASC",
     min_price: min != null ? String(min) : undefined,
     max_price: max != null ? String(max) : undefined,
     tracking_id: TRACK_ID
   };
 
-  // Удаляем undefined и подписываем
-  const clean = Object.fromEntries(Object.entries(params).filter(([,v]) => v !== undefined));
+  const clean = Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined));
   const sign = signParams(clean, APP_SECRET);
   const body = new URLSearchParams({ ...clean, sign }).toString();
 
@@ -77,8 +70,11 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
 
   const data = await rsp.json();
 
-  // Точная форма ответа зависит от версии API.
-  // Ниже — защитное извлечение массива товаров из нескольких возможных мест.
+  // Если API вернул сообщение об ошибке — бросаем исключение
+  if (data?.error_response) {
+    throw new Error(`AE error: ${data.error_response?.msg || JSON.stringify(data.error_response)}`);
+  }
+
   const list =
     data?.result?.result_list?.products ||
     data?.result?.result_list ||
@@ -86,10 +82,7 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     data?.products ||
     [];
 
-  // Приводим товары к нашему фронтовому формату
-  return list
-    .map(toItem(language))
-    .filter(Boolean);
+  return list.map(toItem(language)).filter(Boolean);
 }
 
 function pickKeywords(interests = []) {
@@ -101,7 +94,6 @@ function pickKeywords(interests = []) {
   return arr.length ? arr : ["gift", "present"];
 }
 
-// Подпись: сортируем параметры по ключу, склеиваем "keyvalue", HMAC-SHA256 + hex upper
 function signParams(params, secret) {
   const sorted = Object.keys(params).sort();
   const concatenated = sorted.map(k => `${k}${params[k]}`).join("");
@@ -111,17 +103,11 @@ function signParams(params, secret) {
 
 function toItem(lang) {
   return (p) => {
-    const title =
-      p?.product_title || p?.title || p?.item_title;
-    const image =
-      p?.product_main_image_url || p?.image_url || p?.product_image ||
-      p?.product_small_image_urls?.[0];
-    const price =
-      p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
-    const currency =
-      p?.target_sale_price_currency || p?.currency || "USD";
-    const url =
-      p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
+    const title = p?.product_title || p?.title || p?.item_title;
+    const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
+    const price = p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
+    const currency = p?.target_sale_price_currency || p?.currency || "USD";
+    const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
 
     if (!title || !image || !url || !price) return null;
 
@@ -136,11 +122,11 @@ function toItem(lang) {
       delivery_estimate: null,
       badges: [],
       why: {
-        "ru": "Под интересы и бюджет. Доставка в ваш регион.",
+        ru: "Под интересы и бюджет. Доставка в ваш регион.",
         "pt-BR": "Alinha interesses e orçamento. Envio para sua região."
       },
       tags: [],
-      budget_hint: "" // можно заполнить сопоставлением цены к нашему бакету
+      budget_hint: ""
     };
   };
 }
