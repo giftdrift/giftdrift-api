@@ -1,6 +1,6 @@
 // api/aliexpress.js
-// Лёгкий клиент AliExpress Affiliate API: подписывает запрос и возвращает товары.
-// Если AliExpress вернёт ошибку, выбрасываем исключение — recommendations.js подхватит и уйдёт в моки.
+// AliExpress Affiliate API (TOP) — подпись MD5 (secret + keyvalue + secret)
+// и timestamp в формате 'YYYY-MM-DD HH:mm:ss' (GMT+8).
 
 import crypto from "crypto";
 
@@ -10,15 +10,15 @@ const APP_SECRET = process.env.AE_APP_SECRET;
 const TRACK_ID = process.env.AE_TRACKING_ID;
 
 const BUDGETS = {
-  "$0-10":   { min: 0,   max: 10 },
-  "$11-49":  { min: 11,  max: 49 },
-  "$50-99":  { min: 50,  max: 99 },
-  "$100-499":{ min: 100, max: 499 },
-  "$500-999":{ min: 500, max: 999 },
-  "$1000+":  { min: 1000, max: null }
+  "$0-10":    { min: 0,   max: 10 },
+  "$11-49":   { min: 11,  max: 49 },
+  "$50-99":   { min: 50,  max: 99 },
+  "$100-499": { min: 100, max: 499 },
+  "$500-999": { min: 500, max: 999 },
+  "$1000+":   { min: 1000, max: null }
 };
 
-const INTEREST_KEYWORDS = {
+const KW = {
   "Sports & Outdoor": ["fitness", "gym accessories", "running", "cycling"],
   "Cooking & Food": ["coffee grinder", "kitchen gadget", "spice kit"],
   "Tech & Gadgets": ["mini projector", "smart lamp", "earbuds", "power bank"],
@@ -34,28 +34,42 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     throw new Error("AliExpress credentials are not set");
   }
 
-  const kw = pickKeywords(interests);
+  const keywords = pickKeywords(interests).join(" ");
   const { min, max } = BUDGETS[budget_bucket] || { min: 0, max: null };
+  const lang = language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en");
+  const ts = topTimestampCN(); // 'YYYY-MM-DD HH:mm:ss' GMT+8
 
   const params = {
     method: "aliexpress.affiliate.product.query",
     app_key: APP_KEY,
-    timestamp: Date.now().toString(),
-    sign_method: "HMAC-SHA256",
-    keywords: kw.join(" "),
-    target_language: language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en"),
+    sign_method: "md5",
+    format: "json",
+    v: "1.0",
+    timestamp: ts,
+
+    // бизнес-параметры
+    keywords,
+    target_language: lang,
     page_size: "40",
     page_no: String(page),
     ship_to_country: country,
     sort: "SALE_PRICE_ASC",
+    tracking_id: TRACK_ID,
     min_price: min != null ? String(min) : undefined,
     max_price: max != null ? String(max) : undefined,
-    tracking_id: TRACK_ID
   };
 
-  const clean = Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined));
-  const sign = signParams(clean, APP_SECRET);
+  const clean = Object.fromEntries(Object.entries(params).filter(([,v]) => v !== undefined));
+  const sign = signParamsMD5(clean, APP_SECRET);
   const body = new URLSearchParams({ ...clean, sign }).toString();
+
+  // безопасный лог (без секрета и без длинных данных)
+  console.log("AE request meta:", {
+    method: clean.method,
+    sign_method: clean.sign_method,
+    timestamp: clean.timestamp,
+    hasSign: !!sign,
+  });
 
   const rsp = await fetch(GATEWAY, {
     method: "POST",
@@ -70,9 +84,10 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
 
   const data = await rsp.json();
 
-  // Если API вернул сообщение об ошибке — бросаем исключение
   if (data?.error_response) {
-    throw new Error(`AE error: ${data.error_response?.msg || JSON.stringify(data.error_response)}`);
+    const er = data.error_response;
+    const msg = er.sub_msg || er.msg || JSON.stringify(er);
+    throw new Error(`AE error: ${msg}`);
   }
 
   const list =
@@ -82,23 +97,41 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     data?.products ||
     [];
 
-  return list.map(toItem(language)).filter(Boolean);
+  return (Array.isArray(list) ? list : []).map(toItem(lang)).filter(Boolean);
 }
+
+// ---------- helpers ----------
 
 function pickKeywords(interests = []) {
-  const arr = [];
+  const out = [];
   for (const i of interests) {
-    const ks = INTEREST_KEYWORDS[i];
-    if (ks) arr.push(...ks);
+    const ks = KW[i];
+    if (ks) out.push(...ks);
   }
-  return arr.length ? arr : ["gift", "present"];
+  return out.length ? out : ["gift", "present"];
 }
 
-function signParams(params, secret) {
-  const sorted = Object.keys(params).sort();
-  const concatenated = sorted.map(k => `${k}${params[k]}`).join("");
-  const h = crypto.createHmac("sha256", secret).update(concatenated).digest("hex").toUpperCase();
-  return h;
+// Подпись TOP MD5: MD5( secret + k1v1k2v2... + secret ), ключи в ASCII-порядке
+function signParamsMD5(params, secret) {
+  const sortedKeys = Object.keys(params).sort();
+  const concatenated = sortedKeys.map(k => `${k}${params[k]}`).join("");
+  const str = `${secret}${concatenated}${secret}`;
+  return crypto.createHash("md5").update(str, "utf8").digest("hex").toUpperCase();
+}
+
+// timestamp 'YYYY-MM-DD HH:mm:ss' в часовом поясе GMT+8
+function topTimestampCN(date = new Date()) {
+  // смещение GMT+8 = 8*60 минут
+  const offsetMin = 8 * 60;
+  const local = new Date(date.getTime() + (offsetMin - date.getTimezoneOffset()) * 60000);
+  const pad = (n) => String(n).padStart(2, "0");
+  const yyyy = local.getFullYear();
+  const MM = pad(local.getMonth() + 1);
+  const dd = pad(local.getDate());
+  const HH = pad(local.getHours());
+  const mm = pad(local.getMinutes());
+  const ss = pad(local.getSeconds());
+  return `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
 }
 
 function toItem(lang) {
@@ -108,7 +141,6 @@ function toItem(lang) {
     const price = p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
     const currency = p?.target_sale_price_currency || p?.currency || "USD";
     const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
-
     if (!title || !image || !url || !price) return null;
 
     return {
