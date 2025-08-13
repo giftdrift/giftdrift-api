@@ -1,9 +1,10 @@
 // api/recommendations.js
-// Серверный эндпоинт: сначала пробует AliExpress, если не получилось — отдаёт моки.
-// Включён режим диагностики: добавь ?debug=1 к URL, чтобы в ответе увидеть, подхватились ли переменные и если была ошибка AE.
+// ВОЗВРАЩАЕТ РЕАЛЬНЫЕ ТОВАРЫ ИЗ ALIEXPRESS, а если не получилось — моки.
+// Поддерживает пагинацию (?page=1..) и отладку (?debug=1).
 
 import { queryAliExpress } from "./aliexpress.js";
 
+// --- HTTP handler ---
 export default async function handler(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -16,13 +17,13 @@ export default async function handler(req, res) {
     const body = await readBody(req);
     const qs = getQuery(req);
     const page = Number(qs.get("page") || "1");
-    const debug = qs.get("debug") === "1";
+    const debugFlag = qs.get("debug") === "1";
 
-    // Проверим наличие переменных окружения
+    // Проверка переменных окружения (AppKey/Secret/TrackingID)
     const envOk = !!process.env.AE_APP_KEY && !!process.env.AE_APP_SECRET && !!process.env.AE_TRACKING_ID;
     console.log("AE env present:", envOk);
 
-    // --- 1) Пытаемся получить товары с AliExpress ---
+    // 1) Пытаемся получить товары с AliExpress
     let aeItems = [];
     let aeError = null;
     try {
@@ -39,7 +40,7 @@ export default async function handler(req, res) {
       console.warn("AliExpress failed:", aeError);
     }
 
-    // --- 2) Если AliExpress что‑то вернул — отдаём его, иначе моки ---
+    // 2) Если AliExpress что-то вернул — отдаём его, иначе моки
     let itemsToSend = [];
     let altCount = 0;
 
@@ -54,7 +55,7 @@ export default async function handler(req, res) {
     }
 
     const payload = { items: itemsToSend, alt_count: altCount };
-    if (debug) payload.debug = { envOk, aeCount: aeItems?.length || 0, aeError };
+    if (debugFlag) payload.debug = { envOk, aeCount: aeItems.length || 0, aeError };
     return res.status(200).json(payload);
 
   } catch (e) {
@@ -63,7 +64,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ---------- helpers ----------
+// --- helpers ---
 function getQuery(req) {
   return new URL(req.url, "https://x").searchParams;
 }
@@ -73,17 +74,14 @@ function readBody(req) {
     let data = "";
     req.on("data", c => (data += c));
     req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch (e) {
-        reject(e);
-      }
+      try { resolve(data ? JSON.parse(data) : {}); }
+      catch (e) { reject(e); }
     });
     req.on("error", reject);
   });
 }
 
-// ---------- моки (на случай фолбэка) ----------
+// --- fallback mocks (на случай, если AliExpress упал) ---
 const MOCKS = [
   {
     id: "mock_proj",
