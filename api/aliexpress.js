@@ -201,22 +201,37 @@ function toItem() {
   return (p) => {
     const title = p?.product_title || p?.title || p?.item_title;
     const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
-
-    const rawPrice =
-      p?.target_sale_price ?? p?.target_app_sale_price ??
-      p?.app_sale_price ?? p?.sale_price ?? p?.original_price;
-
-    const value = parseAliPrice(rawPrice);
-    const currency = p?.target_sale_price_currency || "USD";
     const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
 
-    if (!title || !image || !url || !Number.isFinite(value)) return null;
+    // SALE / DISPLAY (что показываем пользователю)
+    const saleRaw =
+      p?.target_sale_price ?? p?.target_app_sale_price ??
+      p?.app_sale_price ?? p?.sale_price ?? p?.original_price;
+    const saleValue = parseAliPrice(saleRaw);
+    const saleCurr = p?.target_sale_price_currency || p?.currency || "USD";
+
+    // ORIGINAL (для фильтрации по бакетам)
+    const origRaw =
+      p?.target_original_price ?? p?.original_price ?? p?.app_sale_price ?? p?.sale_price;
+    const origValue = parseAliPrice(origRaw);
+    const origCurr = p?.target_original_price_currency || saleCurr;
+
+    if (!title || !image || !url || !Number.isFinite(saleValue)) return null;
 
     return {
       id: String(p?.product_id || p?.item_id || Math.random()),
       title,
       image,
-      price: { value, currency, display: currency === "USD" ? `$${value}` : `${value} ${currency}` },
+      price: {                       // показываемая цена
+        value: saleValue,
+        currency: saleCurr,
+        display: saleCurr === "USD" ? `$${saleValue}` : `${saleValue} ${saleCurr}`
+      },
+      price_original: Number.isFinite(origValue) ? {   // «обычная» цена, может отсутствовать
+        value: origValue,
+        currency: origCurr,
+        display: origCurr === "USD" ? `$${origValue}` : `${origValue} ${origCurr}`
+      } : null,
       merchant: "AliExpress",
       source: "aliexpress",
       url_aff: url
