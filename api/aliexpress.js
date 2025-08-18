@@ -205,27 +205,34 @@ function toItem() {
   return (p) => {
     const title = p?.product_title || p?.title || p?.item_title;
     const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
-    const price = p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
+
+    // извлекаем цену и валюту
+    const rawPrice = p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
     const currency = p?.target_sale_price_currency || p?.currency || "USD";
+
+    // парсим в число (убираем $ и лишние символы)
+    let value = null;
+    if (typeof rawPrice === "string") {
+      value = parseFloat(rawPrice.replace(/[^0-9.]/g, ""));
+    } else if (typeof rawPrice === "number") {
+      value = rawPrice;
+    }
+
     const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
-    if (!title || !image || !url || !price) return null;
+    if (!title || !image || !url || !value) return null;
 
     return {
-      id: String(p?.product_id || p?.item_id || Math.random()),
+      id: p?.product_id || p?.item_id || Math.random().toString(36).slice(2),
       title,
       image,
-      price: { value: Number(price), currency, display: formatPrice(Number(price), currency) },
-      merchant: "AliExpress",
-      source: "aliexpress",
-      url_aff: url,
-      delivery_estimate: null,
-      badges: [],
-      why: {
-        ru: "Под интересы и бюджет. Доставка в ваш регион.",
-        "pt-BR": "Alinha interesses e orçamento. Envio para sua região."
+      price: {
+        value,
+        currency,
+        display: `${currency === "USD" ? "$" : currency + " "}${value}`
       },
-      tags: [],
-      budget_hint: ""
+      merchant: p?.shop_name || p?.store_name || "AliExpress",
+      source: "aliexpress",
+      url_aff: url
     };
   };
 }
