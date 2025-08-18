@@ -1,20 +1,18 @@
 // api/recommendations.js
-// Возвращает товары из AliExpress и ЖЁСТКО фильтрует их по выбранному ценовому диапазону (в USD).
+// AliExpress → фильтр по бакету → если пусто, делаем rescue-вызов (min only) → снова фильтр.
 
 import { queryAliExpress } from "./aliexpress.js";
 
-// Бюджетные бакеты — строго совпадают с вариантами в квизе
 const BUDGETS = {
   "$0-10":    { min: 0,   max: 10 },
   "$11-49":   { min: 11,  max: 49 },
   "$50-99":   { min: 50,  max: 99 },
   "$100-499": { min: 100, max: 499 },
   "$500-999": { min: 500, max: 999 },
-  "$1000+":   { min: 1000, max: null } // null = без верхней границы
+  "$1000+":   { min: 1000, max: null }
 };
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -27,18 +25,13 @@ export default async function handler(req, res) {
     const page = Number(qs.get("page") || "1");
     const debugFlag = qs.get("debug") === "1";
 
-    // Проверка наличия ключей AE в окружении
     const envOk = !!process.env.AE_APP_KEY && !!process.env.AE_APP_SECRET && !!process.env.AE_TRACKING_ID;
 
-    // Входные поля из квиза
-    const country = body.country || "BR";         // "RU" | "BR"
-    const language = body.language || "pt-BR";    // "ru" | "pt-BR" | "en"
+    const country = body.country || "BR";
+    const language = body.language || "pt-BR";
     const budget_bucket = body.budget_bucket || "$11-49";
-    const interests = Array.isArray(body.interests) && body.interests.length
-      ? body.interests
-      : ["Tech & Gadgets"];
+    const interests = Array.isArray(body.interests) && body.interests.length ? body.interests : ["Tech & Gadgets"];
 
-    // 1) Тянем товары у AliExpress (внутри aliexpress.js уже есть fallback-стратегии и target_currency: "USD")
     let fetched = [];
     let aeError = null;
     try {
@@ -48,16 +41,33 @@ export default async function handler(req, res) {
       fetched = [];
     }
 
-    // 2) Серверная фильтрация по выбранному ценовому бакету (цены в USD)
     const range = BUDGETS[budget_bucket] || BUDGETS["$11-49"];
-    const kept = filterByBudgetUSD(fetched, range);
+    let kept = filterByBudgetUSD(fetched, range);
+    let rescueUsed = false;
 
-    // 3) Ответ
+    // Если пусто — делаем спасательный вызов (min only)
+    if (kept.length === 0) {
+      try {
+        const fetchedRescue = await queryAliExpress({ country, language, budget_bucket, interests, page, rescueMinOnly: true });
+        const keptRescue = filterByBudgetUSD(fetchedRescue, range);
+        if (keptRescue.length) {
+          kept = keptRescue;
+          rescueUsed = true;
+        }
+      } catch (e) {
+        aeError = (aeError ? aeError + " | " : "") + (e?.message || String(e));
+      }
+    }
+
+    // Если всё ещё пусто — отдадим ближайшие к нижней границе (чтобы не показывать пустой экран)
+    if (kept.length === 0 && (fetched?.length || 0) > 0) {
+      kept = nearestToMin(fetched, range.min ?? 0).slice(0, 6);
+    }
+
     const items = kept.slice(0, 6);
     const alt_count = Math.max(0, kept.length - 6);
 
     const payload = { items, alt_count };
-
     if (debugFlag) {
       payload.debug = {
         envOk,
@@ -65,7 +75,8 @@ export default async function handler(req, res) {
         budget_bucket,
         fetched: fetched.length,
         kept: kept.length,
-        samplePrice: fetched[0]?.price, // для быстрой проверки формата
+        rescueUsed,
+        samplePrice: fetched[0]?.price,
         aeError
       };
     }
@@ -82,26 +93,26 @@ export default async function handler(req, res) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (c) => (data += c));
-    req.on("end", () => {
-      try { resolve(data ? JSON.parse(data) : {}); }
-      catch (e) { reject(e); }
-    });
+    req.on("data", c => (data += c));
+    req.on("end", () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
     req.on("error", reject);
   });
 }
 
-/**
- * Фильтруем товары по цене в USD.
- * Ожидается, что aliexpress.js нормализует цену как:
- *   item.price = { value: <number USD>, currency: "USD", display: "$<value>" }
- */
 function filterByBudgetUSD(items, { min, max }) {
-  return (items || []).filter((it) => {
+  return (items || []).filter(it => {
     const v = Number(it?.price?.value);
     if (!Number.isFinite(v)) return false;
     if (v < min) return false;
-    if (max != null && v > max) return false; // включительно на верхней границе
+    if (max != null && v > max) return false;
     return true;
   });
+}
+
+function nearestToMin(items, floor) {
+  return (items || [])
+    .map(it => ({ it, v: Number(it?.price?.value) }))
+    .filter(x => Number.isFinite(x.v))
+    .sort((a, b) => (Math.abs(a.v - floor) - Math.abs(b.v - floor)))
+    .map(x => x.it);
 }
