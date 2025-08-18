@@ -1,16 +1,15 @@
 // api/recommendations.js
-// AliExpress → жесткий фильтр по бакету → rescue-вызов (min only) → «ближайшие к min», чтобы избежать пустых выдач.
+// Многостраничный подбор + rescue: AliExpress → фильтр по бакету → добор со страниц и min-only → «ближайшие к min».
 
 import { queryAliExpress } from "./aliexpress.js";
 
-// Бакеты — должны совпадать с фронтом
 const BUDGETS = {
   "$0-10":    { min: 0,   max: 10 },
   "$11-49":   { min: 11,  max: 49 },
   "$50-99":   { min: 50,  max: 99 },
   "$100-499": { min: 100, max: 499 },
   "$500-999": { min: 500, max: 999 },
-  "$1000+":   { min: 1000, max: null } // null = без верхнего потолка
+  "$1000+":   { min: 1000, max: null }
 };
 
 export default async function handler(req, res) {
@@ -24,81 +23,86 @@ export default async function handler(req, res) {
   try {
     const body = await readBody(req);
     const qs = new URL(req.url, "https://x").searchParams;
-    const page = Number(qs.get("page") || "1");
+    const startPage = Number(qs.get("page") || "1");
     const debugFlag = qs.get("debug") === "1";
 
     const envOk = !!process.env.AE_APP_KEY && !!process.env.AE_APP_SECRET && !!process.env.AE_TRACKING_ID;
 
-    // Входные поля из квиза
-    const country = body.country || "BR";         // "RU" | "BR"
-    const language = body.language || "pt-BR";    // "ru" | "pt-BR" | "en"
+    // Из квиза
+    const country = body.country || "BR";
+    const language = body.language || "pt-BR";
     const budget_bucket = body.budget_bucket || "$11-49";
-    const interests = Array.isArray(body.interests) && body.interests.length
-      ? body.interests
-      : ["Tech & Gadgets"];
-
-    // Диапазон по бакету
+    const interests = Array.isArray(body.interests) && body.interests.length ? body.interests : ["Tech & Gadgets"];
     const range = BUDGETS[budget_bucket] || BUDGETS["$11-49"];
 
-    // 1) Базовый запрос
-    let fetched = [];
+    // --- 1) Основной цикл: до 5 страниц + rescue на каждой странице ---
+    const TARGET_COUNT = 6;
+    const MAX_PAGES = 5;
+
+    let collected = [];
+    let fetchedAll = [];         // для debug и fallback ближайших
+    let pagesTried = 0;
+    let rescueHits = 0;
     let aeError = null;
-    try {
-      fetched = await queryAliExpress({ country, language, budget_bucket, interests, page });
-    } catch (e) {
-      aeError = e?.message || String(e);
-      fetched = [];
-    }
 
-    // 2) Жёсткая фильтрация по бакету (USD number)
-    let kept = filterByBudgetUSD(fetched, range);
+    for (let p = startPage; p < startPage + MAX_PAGES && collected.length < TARGET_COUNT; p++) {
+      pagesTried++;
 
-    // 3) Rescue: если пусто — второй вызов к AE (min only, без max, SALE_PRICE_ASC)
-    let rescueUsed = false;
-    if (kept.length === 0) {
+      // базовый запрос
+      let pageItems = [];
       try {
-        const rescued = await queryAliExpress({
-          country,
-          language,
-          budget_bucket,
-          interests,
-          page,
-          rescueMinOnly: true
-        });
-        const keptRescue = filterByBudgetUSD(rescued, range);
-        if (keptRescue.length) {
-          kept = keptRescue;
-          rescueUsed = true;
-        }
+        pageItems = await queryAliExpress({ country, language, budget_bucket, interests, page: p });
       } catch (e) {
         aeError = (aeError ? aeError + " | " : "") + (e?.message || String(e));
       }
+
+      fetchedAll.push(...(pageItems || []));
+
+      // фильтруем по бакету
+      const kept = filterByBudgetUSD(pageItems, range);
+      collected.push(...kept);
+
+      // если всё ещё мало — rescue (min only) на той же странице
+      if (collected.length < TARGET_COUNT) {
+        try {
+          const rescuePage = await queryAliExpress({ country, language, budget_bucket, interests, page: p, rescueMinOnly: true });
+          fetchedAll.push(...(rescuePage || []));
+          const keptRescue = filterByBudgetUSD(rescuePage, range);
+          if (keptRescue.length) rescueHits++;
+          collected.push(...keptRescue);
+        } catch (e) {
+          aeError = (aeError ? aeError + " | " : "") + (e?.message || String(e));
+        }
+      }
     }
 
-    // 4) «Ближайшие к нижней границе»: чтобы не отдавать пусто
-    // Берём товары ≥ 60% от min и сортируем по расстоянию к min
-    if (kept.length === 0 && (fetched?.length || 0) > 0) {
+    // Удалим дубликаты по id/url_aff
+    collected = dedupeByKey(collected, (x) => x?.id || x?.url_aff || x?.title);
+
+    // --- 2) Если после всех попыток всё ещё пусто — возьмём ближайшие к нижней границе ---
+    if (collected.length === 0 && fetchedAll.length) {
       const floor = typeof range.min === "number" ? range.min : 0;
-      kept = nearestToMin(fetched, floor).slice(0, 12);
+      collected = nearestToMin(fetchedAll, floor).slice(0, TARGET_COUNT);
     }
 
-    // 5) Ответ (до 6 карточек)
-    const items = kept.slice(0, 6);
-    const alt_count = Math.max(0, kept.length - 6);
+    // --- 3) Финальная выборка для ответа ---
+    const items = collected.slice(0, TARGET_COUNT);
+    const alt_count = Math.max(0, collected.length - TARGET_COUNT);
 
     const payload = { items, alt_count };
+
     if (debugFlag) {
       payload.debug = {
         envOk,
-        page,
+        page: startPage,
+        pagesTried,
         budget_bucket,
-        fetched: fetched.length,
-        kept: kept.length,
-        rescueUsed,
-        // покажем первые 10 цен, чтобы быстро видеть вход
-        fetchedPrices: (fetched || []).slice(0, 10).map(x => x?.price?.value),
-        // и первые 10 оставшихся после фильтра
-        keptPrices: (kept || []).slice(0, 10).map(x => x?.price?.value),
+        fetched: fetchedAll.length,
+        kept: collected.length,
+        rescueHits,
+        // первые 10 цен для быстрой проверки
+        fetchedPrices: fetchedAll.slice(0, 10).map(x => x?.price?.value),
+        keptPrices: collected.slice(0, 10).map(x => x?.price?.value),
         aeError
       };
     }
@@ -124,9 +128,7 @@ function readBody(req) {
   });
 }
 
-/**
- * Фильтр по бакету — использует price.value (ожидается USD number).
- */
+// Фильтр по бакету — ожидаем USD number в item.price.value
 function filterByBudgetUSD(items, { min, max }) {
   return (items || []).filter((it) => {
     const v = Number(it?.price?.value);
@@ -137,9 +139,7 @@ function filterByBudgetUSD(items, { min, max }) {
   });
 }
 
-/**
- * Ближайшие к нижней границе, но отсечём «совсем дешёвку» (< 60% от min).
- */
+// Ближайшие к нижней границе, отсекём < 60% от min
 function nearestToMin(items, floor) {
   const cutoff = Math.max(0, floor * 0.6);
   return (items || [])
@@ -147,4 +147,17 @@ function nearestToMin(items, floor) {
     .filter(x => Number.isFinite(x.v) && x.v >= cutoff)
     .sort((a, b) => (Math.abs(a.v - floor) - Math.abs(b.v - floor)))
     .map(x => x.it);
+}
+
+// Простая дедупликация
+function dedupeByKey(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr || []) {
+    const k = keyFn(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
 }
