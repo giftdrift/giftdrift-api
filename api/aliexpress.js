@@ -35,67 +35,64 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     throw new Error("AliExpress credentials are not set");
   }
 
+  const baseKw = pickKeywords(interests);
   const { min, max } = getRange(budget_bucket);
-  const keywords = pickKeywords(interests).join(" ");
   const lang = language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en");
 
-  // Попытка 1 — строгая: локальный язык, доставка, min/max, сортируем по популярности (лучше, чем price asc)
-  let r = await callTop("aliexpress.affiliate.product.query", {
-    keywords,
-    target_language: lang,
+  // Хелпер для сборки общих параметров
+  const common = (overrides = {}) => ({
     target_currency: "USD",
+    page_no: String(page),
+    tracking_id: TRACK_ID,
+    ...overrides
+  });
+
+  // Попытка 1 — строгая: локальный язык, доставка, min/max, популярность
+  let r = await callTop("aliexpress.affiliate.product.query", common({
+    keywords: baseKw.join(" "),
+    target_language: lang,
     page_size: "40",
-    page_no: String(page),
+    sort: "VOLUME_DESC",
     ship_to_country: country,
-    sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID,
     ...(min != null ? { min_price: String(min) } : {}),
-    ...(max != null ? { max_price: String(max) } : {})
-  });
+    ...(max != null ? { max_price: String(max) } : {}),
+  }));
   if (r.items.length) return r.items;
 
-  // Попытка 2 — без ship_to_country, но с тем же ценовым коридором
-  r = await callTop("aliexpress.affiliate.product.query", {
-    keywords,
+  // Попытка 2 — без доставки, тот же диапазон
+  r = await callTop("aliexpress.affiliate.product.query", common({
+    keywords: baseKw.join(" "),
     target_language: lang,
-    target_currency: "USD",
     page_size: "60",
-    page_no: String(page),
     sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID,
     ...(min != null ? { min_price: String(min) } : {}),
-    ...(max != null ? { max_price: String(max) } : {})
-  });
+    ...(max != null ? { max_price: String(max) } : {}),
+  }));
   if (r.items.length) return r.items;
 
-  // Попытка 3 — принудительно EN, тот же диапазон
-  r = await callTop("aliexpress.affiliate.product.query", {
-    keywords,
+  // Попытка 3 — английский, тот же диапазон
+  r = await callTop("aliexpress.affiliate.product.query", common({
+    keywords: baseKw.join(" "),
     target_language: "en",
-    target_currency: "USD",
     page_size: "80",
-    page_no: String(page),
     sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID,
     ...(min != null ? { min_price: String(min) } : {}),
-    ...(max != null ? { max_price: String(max) } : {})
-  });
+    ...(max != null ? { max_price: String(max) } : {}),
+  }));
   if (r.items.length) return r.items;
 
-  // Попытка 4 — мягкое расширение диапазона (±20%), EN, без доставки
-  const widened = widenRange({ min, max }, 0.2);
-  r = await callTop("aliexpress.affiliate.product.query", {
-    keywords,
+  // Попытка 4 — «спасательная»: только нижняя граница, без max, с "premium gift", сортировка по цене (возрастание)
+  // Это подгонит выдачу к нижней кромке выбранного бакета ($50-99 → от $50 и выше).
+  const rescueKeywords = [...baseKw, "premium", "gift"].join(" ");
+  r = await callTop("aliexpress.affiliate.product.query", common({
+    keywords: rescueKeywords,
     target_language: "en",
-    target_currency: "USD",
     page_size: "100",
-    page_no: String(page),
-    sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID,
-    ...(widened.min != null ? { min_price: String(widened.min) } : {}),
-    ...(widened.max != null ? { max_price: String(widened.max) } : {})
-  });
-  return r.items; // может вернуться пусто — тогда наружный фильтр просто ничего не покажет
+    sort: "SALE_PRICE_ASC",           // с min_price даёт ближайшие к min
+    ...(min != null ? { min_price: String(min) } : {}),
+    // max намеренно не передаём
+  }));
+  return r.items;
 }
 
 // ---------- TOP caller + utils ----------
