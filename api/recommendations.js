@@ -1,16 +1,16 @@
 // api/recommendations.js
-// Возвращает товары из AliExpress и жестко фильтрует их по выбранному ценовому диапазону.
+// Возвращает товары из AliExpress и ЖЁСТКО фильтрует их по выбранному ценовому диапазону (в USD).
 
 import { queryAliExpress } from "./aliexpress.js";
 
-// те же бакеты, что в квизе
+// Бюджетные бакеты — строго совпадают с вариантами в квизе
 const BUDGETS = {
   "$0-10":    { min: 0,   max: 10 },
   "$11-49":   { min: 11,  max: 49 },
   "$50-99":   { min: 50,  max: 99 },
   "$100-499": { min: 100, max: 499 },
   "$500-999": { min: 500, max: 999 },
-  "$1000+":   { min: 1000, max: null }
+  "$1000+":   { min: 1000, max: null } // null = без верхней границы
 };
 
 export default async function handler(req, res) {
@@ -27,39 +27,49 @@ export default async function handler(req, res) {
     const page = Number(qs.get("page") || "1");
     const debugFlag = qs.get("debug") === "1";
 
+    // Проверка наличия ключей AE в окружении
     const envOk = !!process.env.AE_APP_KEY && !!process.env.AE_APP_SECRET && !!process.env.AE_TRACKING_ID;
 
-    // входные данные из квиза
-    const country = body.country || "BR";           // "RU" | "BR"
-    const language = body.language || "pt-BR";      // "ru" | "pt-BR" | "en"
+    // Входные поля из квиза
+    const country = body.country || "BR";         // "RU" | "BR"
+    const language = body.language || "pt-BR";    // "ru" | "pt-BR" | "en"
     const budget_bucket = body.budget_bucket || "$11-49";
-    const interests = Array.isArray(body.interests) && body.interests.length ? body.interests : ["Tech & Gadgets"];
+    const interests = Array.isArray(body.interests) && body.interests.length
+      ? body.interests
+      : ["Tech & Gadgets"];
 
-    // 1) тянем товары из AliExpress (внутри уже есть fallback-стратегии)
-    let raw = [];
+    // 1) Тянем товары у AliExpress (внутри aliexpress.js уже есть fallback-стратегии и target_currency: "USD")
+    let fetched = [];
     let aeError = null;
     try {
-      raw = await queryAliExpress({ country, language, budget_bucket, interests, page });
+      fetched = await queryAliExpress({ country, language, budget_bucket, interests, page });
     } catch (e) {
       aeError = e?.message || String(e);
-      raw = [];
+      fetched = [];
     }
 
-    // 2) серверная фильтрация по цене (на случай, если Ali вернул что-то вне диапазона)
+    // 2) Серверная фильтрация по выбранному ценовому бакету (цены в USD)
     const range = BUDGETS[budget_bucket] || BUDGETS["$11-49"];
-    const items = filterByBudget(raw, range);
+    const kept = filterByBudgetUSD(fetched, range);
 
-    const payload = { items: items.slice(0, 6), alt_count: Math.max(0, items.length - 6) };
+    // 3) Ответ
+    const items = kept.slice(0, 6);
+    const alt_count = Math.max(0, kept.length - 6);
+
+    const payload = { items, alt_count };
+
     if (debugFlag) {
       payload.debug = {
         envOk,
         page,
         budget_bucket,
-        fetched: raw.length,
-        kept: items.length,
+        fetched: fetched.length,
+        kept: kept.length,
+        samplePrice: fetched[0]?.price, // для быстрой проверки формата
         aeError
       };
     }
+
     return res.status(200).json(payload);
   } catch (e) {
     console.error("recommendations error:", e);
@@ -67,7 +77,7 @@ export default async function handler(req, res) {
   }
 }
 
-// --- helpers ---
+// ---------- helpers ----------
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -81,13 +91,17 @@ function readBody(req) {
   });
 }
 
-// Фильтруем товары по цене. max=null означает «без верхней границы».
-function filterByBudget(items, { min, max }) {
-  return (items || []).filter(it => {
+/**
+ * Фильтруем товары по цене в USD.
+ * Ожидается, что aliexpress.js нормализует цену как:
+ *   item.price = { value: <number USD>, currency: "USD", display: "$<value>" }
+ */
+function filterByBudgetUSD(items, { min, max }) {
+  return (items || []).filter((it) => {
     const v = Number(it?.price?.value);
-    if (!isFinite(v)) return false;
+    if (!Number.isFinite(v)) return false;
     if (v < min) return false;
-    if (max != null && v > max) return false;
+    if (max != null && v > max) return false; // включительно на верхней границе
     return true;
   });
 }
