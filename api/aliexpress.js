@@ -1,5 +1,5 @@
 // api/aliexpress.js
-// AliExpress Affiliate API (TOP). Подпись MD5, корректный timestamp и "железный" парсер ответа.
+// AliExpress Affiliate API (TOP). Подпись MD5, USD-цены, явные min/max во всех попытках, fallback с расширением диапазона.
 
 import crypto from "crypto";
 
@@ -8,6 +8,7 @@ const APP_KEY = process.env.AE_APP_KEY;
 const APP_SECRET = process.env.AE_APP_SECRET;
 const TRACK_ID = process.env.AE_TRACKING_ID;
 
+// Бакеты бюджета — синхронны с фронтом/рекомендациями
 const BUDGETS = {
   "$0-10":    { min: 0,   max: 10 },
   "$11-49":   { min: 11,  max: 49 },
@@ -17,6 +18,7 @@ const BUDGETS = {
   "$1000+":   { min: 1000, max: null }
 };
 
+// Ключевики по интересам
 const KW = {
   "Sports & Outdoor": ["fitness", "gym accessories", "running", "cycling"],
   "Cooking & Food": ["coffee grinder", "kitchen gadget", "spice kit"],
@@ -33,45 +35,67 @@ export async function queryAliExpress({ country, language, budget_bucket, intere
     throw new Error("AliExpress credentials are not set");
   }
 
+  const { min, max } = getRange(budget_bucket);
   const keywords = pickKeywords(interests).join(" ");
-  const { min, max } = BUDGETS[budget_bucket] || { min: 0, max: null };
   const lang = language?.startsWith("pt") ? "pt" : (language === "ru" ? "ru" : "en");
 
-  // 1) Строгий запрос (как в твоём успешном логе: RU/BR, локальный язык, цена и доставка)
-  const strict = await callTop("aliexpress.affiliate.product.query", {
+  // Попытка 1 — строгая: локальный язык, доставка, min/max, сортируем по популярности (лучше, чем price asc)
+  let r = await callTop("aliexpress.affiliate.product.query", {
     keywords,
     target_language: lang,
+    target_currency: "USD",
     page_size: "40",
     page_no: String(page),
     ship_to_country: country,
-    sort: "SALE_PRICE_ASC",
+    sort: "VOLUME_DESC",
     tracking_id: TRACK_ID,
-    min_price: min != null ? String(min) : undefined,
-    max_price: max != null ? String(max) : undefined
+    ...(min != null ? { min_price: String(min) } : {}),
+    ...(max != null ? { max_price: String(max) } : {})
   });
-  if (strict.items.length) return strict.items;
+  if (r.items.length) return r.items;
 
-  // 2) Релакс — убираем цену/доставку и берём популярность
-  const relaxed = await callTop("aliexpress.affiliate.product.query", {
+  // Попытка 2 — без ship_to_country, но с тем же ценовым коридором
+  r = await callTop("aliexpress.affiliate.product.query", {
     keywords,
     target_language: lang,
-    page_size: "100",
+    target_currency: "USD",
+    page_size: "60",
     page_no: String(page),
     sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID
+    tracking_id: TRACK_ID,
+    ...(min != null ? { min_price: String(min) } : {}),
+    ...(max != null ? { max_price: String(max) } : {})
   });
-  if (relaxed.items.length) return relaxed.items;
+  if (r.items.length) return r.items;
 
-  // 3) Пробуем EN (часто богаче выдача)
-  const en = await callTop("aliexpress.affiliate.product.query", {
+  // Попытка 3 — принудительно EN, тот же диапазон
+  r = await callTop("aliexpress.affiliate.product.query", {
     keywords,
     target_language: "en",
+    target_currency: "USD",
+    page_size: "80",
+    page_no: String(page),
+    sort: "VOLUME_DESC",
+    tracking_id: TRACK_ID,
+    ...(min != null ? { min_price: String(min) } : {}),
+    ...(max != null ? { max_price: String(max) } : {})
+  });
+  if (r.items.length) return r.items;
+
+  // Попытка 4 — мягкое расширение диапазона (±20%), EN, без доставки
+  const widened = widenRange({ min, max }, 0.2);
+  r = await callTop("aliexpress.affiliate.product.query", {
+    keywords,
+    target_language: "en",
+    target_currency: "USD",
     page_size: "100",
     page_no: String(page),
     sort: "VOLUME_DESC",
-    tracking_id: TRACK_ID
+    tracking_id: TRACK_ID,
+    ...(widened.min != null ? { min_price: String(widened.min) } : {}),
+    ...(widened.max != null ? { max_price: String(widened.max) } : {})
   });
-  return en.items;
+  return r.items; // может вернуться пусто — тогда наружный фильтр просто ничего не покажет
 }
 
 // ---------- TOP caller + utils ----------
@@ -88,17 +112,19 @@ async function callTop(method, bizParams) {
     ...bizParams
   };
 
-  const clean = Object.fromEntries(Object.entries(params).filter(([,v]) => v !== undefined));
+  const clean = Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined));
   const sign = signParamsMD5(clean, APP_SECRET);
   const body = new URLSearchParams({ ...clean, sign }).toString();
 
+  // Короткий лог для отладки
   console.log("AE request meta:", {
-    method: clean.method,
     lang: clean.target_language,
     page_no: clean.page_no,
-    priced: !!(clean.min_price || clean.max_price),
+    sort: clean.sort,
     ship_to: !!clean.ship_to_country,
-    sort: clean.sort
+    priced: !!(clean.min_price || clean.max_price),
+    min_price: clean.min_price || null,
+    max_price: clean.max_price || null
   });
 
   const rsp = await fetch(GATEWAY, {
@@ -119,7 +145,6 @@ async function callTop(method, bizParams) {
     throw new Error(`AE error: ${msg}`);
   }
 
-  // --- ЖЕЛЕЗНЫЙ ПАРСЕР — под твою структуру (products.product[]) + фолбэк ---
   const products = extractProducts(data);
   console.log("AE parsed items:", products.length);
 
@@ -128,28 +153,27 @@ async function callTop(method, bizParams) {
 }
 
 function extractProducts(data) {
-  // 1) TOP-обёртки
+  // TOP-обёртки
   let node =
     data?.aliexpress_affiliate_product_query_response?.resp_result?.result ??
     data?.aliexpress_affiliate_product_query_response?.result ??
     data?.result ?? data?.data ?? data;
 
-  // 2) Если result — строка JSON
   if (typeof node === "string") {
     try { node = JSON.parse(node); } catch {}
   }
 
-  // 3) Точный путь из твоего ae-test: products.product[]
+  // Точный путь, который показал твой ae-test: products.product[]
   let list =
     node?.products?.product ??
-    node?.result_list?.products?.product ?? // иногда лежит глубже
+    node?.result_list?.products?.product ??
     node?.result_list?.products ??
     node?.result_list?.product ??
     node?.products ?? node?.items;
 
   if (Array.isArray(list)) return list;
 
-  // 4) Глубокий поиск первого массива, похожего на список товаров
+  // Глубокий поиск массива, похожего на товары
   const deep = deepFindFirstArray(node);
   return Array.isArray(deep) ? deep : [];
 }
@@ -179,7 +203,52 @@ function pickKeywords(interests = []) {
   return out.length ? out : ["gift", "present"];
 }
 
-// TOP MD5: MD5(secret + k1v1k2v2... + secret), ключи по ASCII
+// Нормализация товара: цена — число USD
+function toItem() {
+  return (p) => {
+    const title = p?.product_title || p?.title || p?.item_title;
+    const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
+
+    const rawPrice =
+      p?.target_sale_price ?? p?.target_app_sale_price ??
+      p?.app_sale_price ?? p?.sale_price ?? p?.original_price;
+
+    const value = parseAliPrice(rawPrice); // число
+    const currency = p?.target_sale_price_currency || "USD";
+    const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
+
+    if (!title || !image || !url || !Number.isFinite(value)) return null;
+
+    return {
+      id: String(p?.product_id || p?.item_id || Math.random()),
+      title,
+      image,
+      price: { value, currency, display: currency === "USD" ? `$${value}` : `${value} ${currency}` },
+      merchant: "AliExpress",
+      source: "aliexpress",
+      url_aff: url,
+      delivery_estimate: null,
+      badges: [],
+      why: {
+        ru: "Под интересы и бюджет. Доставка в ваш регион.",
+        "pt-BR": "Alinha interesses e orçamento. Envio para sua região."
+      },
+      tags: [],
+      budget_hint: ""
+    };
+  };
+}
+
+function parseAliPrice(x) {
+  if (x == null) return NaN;
+  if (typeof x === "number") return x;
+  // Примеры: "US $58.99", "58.99", "1,234.56"
+  const s = String(x).replace(/[^\d.,]/g, "").replace(/,/g, "");
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN;
+}
+
+// Подпись TOP MD5: MD5(secret + k1v1k2v2... + secret), ключи по ASCII
 function signParamsMD5(params, secret) {
   const sortedKeys = Object.keys(params).sort();
   const concatenated = sortedKeys.map(k => `${k}${params[k]}`).join("");
@@ -201,44 +270,14 @@ function topTimestampCN(date = new Date()) {
   return `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
 }
 
-function toItem() {
-  return (p) => {
-    const title = p?.product_title || p?.title || p?.item_title;
-    const image = p?.product_main_image_url || p?.image_url || p?.product_image || p?.product_small_image_urls?.[0];
-
-    // извлекаем цену и валюту
-    const rawPrice = p?.target_sale_price || p?.sale_price || p?.app_sale_price || p?.original_price;
-    const currency = p?.target_sale_price_currency || p?.currency || "USD";
-
-    // парсим в число (убираем $ и лишние символы)
-    let value = null;
-    if (typeof rawPrice === "string") {
-      value = parseFloat(rawPrice.replace(/[^0-9.]/g, ""));
-    } else if (typeof rawPrice === "number") {
-      value = rawPrice;
-    }
-
-    const url = p?.promotion_link || p?.target_url || p?.product_detail_url || p?.detail_url;
-    if (!title || !image || !url || !value) return null;
-
-    return {
-      id: p?.product_id || p?.item_id || Math.random().toString(36).slice(2),
-      title,
-      image,
-      price: {
-        value,
-        currency,
-        display: `${currency === "USD" ? "$" : currency + " "}${value}`
-      },
-      merchant: p?.shop_name || p?.store_name || "AliExpress",
-      source: "aliexpress",
-      url_aff: url
-    };
-  };
+function getRange(bucket) {
+  return BUDGETS[bucket] || BUDGETS["$11-49"];
 }
 
-function formatPrice(v, cur) {
-  if (cur === "BRL") return `R$${v}`;
-  if (cur === "RUB") return `${v} ₽`;
-  return `$${v}`;
+function widenRange({ min, max }, pct = 0.2) {
+  const widen = (v, sign) => Math.max(0, Math.round((v + sign * v * pct) * 100) / 100);
+  const out = { min, max };
+  if (min != null) out.min = widen(min, -1);      // -20%
+  if (max != null) out.max = widen(max, +1);      // +20%
+  return out;
 }
